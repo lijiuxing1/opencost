@@ -4,9 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/signers"
+	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/client"
+	"github.com/aliyun/credentials-go/credentials"
 	"github.com/opencost/opencost/pkg/cloud/models"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -54,7 +53,7 @@ func TestCreateDescribePriceACSRequest(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := createDescribePriceACSRequest(c.testStruct)
+			_, _, err := createDescribePriceACSRequest(c.testStruct)
 			if err != nil && c.expectedError == nil {
 				t.Fatalf("Case name %s: Error converting to Alibaba cloud request", c.name)
 			}
@@ -71,13 +70,18 @@ func TestProcessDescribePriceAndCreateAlibabaPricing(t *testing.T) {
 	// This test case was use to test all general puprose instances
 
 	t.Skip()
+	credential, err := credentials.NewCredential(nil); if err != nil {
+			t.Errorf(" unable to new credential for alibaba cloud sdk client: %w", err)
+	}
 
-	client, err := sdk.NewClientWithAccessKey("cn-hangzhou", "XXX_KEY_ID", "XXX_SECRET_ID")
+	config := openapi.Config{
+		Credential: credential,
+	}
+
+	client, err := openapi.NewClient(&config)
 	if err != nil {
 		t.Errorf("Error connecting to the Alibaba cloud")
 	}
-	aak := credentials.NewAccessKeyCredential("XXX_KEY_ID", "XXX_SECRET_ID")
-	signer := signers.NewAccessKeySigner(aak)
 
 	cases := []struct {
 		name          string
@@ -412,7 +416,7 @@ func TestProcessDescribePriceAndCreateAlibabaPricing(t *testing.T) {
 	custom := &models.CustomPricing{}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			pricingObj, err := processDescribePriceAndCreateAlibabaPricing(client, c.teststruct, signer, custom)
+			pricingObj, err := processDescribePriceAndCreateAlibabaPricing(client, c.teststruct, custom)
 			if err != nil && c.expectedError == nil {
 				t.Fatalf("Case name %s: got an error %s", c.name, err)
 			}

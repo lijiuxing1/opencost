@@ -226,6 +226,9 @@ func (cfw *ConfigFileWatcher) GetConfigs() []cloud.KeyedConfig {
 			AlibabaServiceKeyName:   customPricing.AlibabaServiceKeyName,
 			AlibabaServiceKeySecret: customPricing.AlibabaServiceKeySecret,
 			AlibabaAccountID:        customPricing.ProjectID,
+			AlibabaRoleArn:          customPricing.AlibabaRoleArn,
+			AlibabaOidcProviderArn:  customPricing.AlibabaOidcProviderArn,
+			AlibabaOidcTokenFile:    customPricing.AlibabaOidcTokenFile,
 		}
 		kc := alibaba.ConvertAlibabaInfoToConfig(aliCloudInfo)
 		configs = append(configs, kc)

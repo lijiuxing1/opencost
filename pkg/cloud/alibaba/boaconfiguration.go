@@ -120,16 +120,29 @@ func ConvertAlibabaInfoToConfig(acc AlibabaInfo) cloud.KeyedConfig {
 	if acc.IsEmpty() {
 		return nil
 	}
-	var configurer Authorizer
 
-	configurer = &AccessKey{
-		AccessKeyID:     acc.AlibabaServiceKeyName,
-		AccessKeySecret: acc.AlibabaServiceKeySecret,
-	}
+	if acc.AlibabaServiceKeyName != "" && acc.AlibabaServiceKeySecret != "" {
+		configurer := &AccessKey{
+			AccessKeyID:     acc.AlibabaServiceKeyName,
+			AccessKeySecret: acc.AlibabaServiceKeySecret,
+		}
 
-	return &BOAConfiguration{
-		Account:    acc.AlibabaAccountID,
-		Region:     acc.AlibabaClusterRegion,
-		Authorizer: configurer,
-	}
+		return &BOAConfiguration{
+			Account:    acc.AlibabaAccountID,
+			Region:     acc.AlibabaClusterRegion,
+			Authorizer: configurer,
+		}
+	} else {
+		configurer := &Oidc{
+			RoleArn:           acc.AlibabaRoleArn,
+			OIDCProviderArn:   acc.AlibabaOidcProviderArn,
+			OIDCTokenFilePath: acc.AlibabaOidcTokenFile,
+		}
+
+		return &BOAConfiguration{
+			Account:    acc.AlibabaAccountID,
+			Region:     acc.AlibabaClusterRegion,
+			Authorizer: configurer,
+    }
+	} 
 }

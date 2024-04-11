@@ -2,6 +2,7 @@ package alibaba
 
 import (
 	"errors"
+	ejson "encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,10 +12,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/signers"
+	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/client"
+	"github.com/alibabacloud-go/tea-utils/v2/service"
+	"github.com/alibabacloud-go/tea/tea"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
+	"github.com/aliyun/credentials-go/credentials"
 	"github.com/opencost/opencost/core/pkg/env"
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/core/pkg/opencost"
@@ -59,6 +61,11 @@ const (
 	ALIBABA_DEFAULT_DATADISK_SIZE              = "2000"
 	ALIBABA_DISK_TOPOLOGY_REGION_LABEL         = "topology.diskplugin.csi.alibabacloud.com/region"
 	ALIBABA_DISK_TOPOLOGY_ZONE_LABEL           = "topology.diskplugin.csi.alibabacloud.com/zone"
+)
+
+const (
+	OIDC_CREDENTIAL_TYPE = "oidc_role_arn"
+	OIDC_ROLE_SESSION_NAME = "role_session_name_opencost"
 )
 
 var (
@@ -130,6 +137,9 @@ type AlibabaInfo struct {
 	AlibabaServiceKeyName   string `json:"serviceKeyName"`
 	AlibabaServiceKeySecret string `json:"serviceKeySecret"`
 	AlibabaAccountID        string `json:"accountID"`
+	AlibabaRoleArn          string `json:"roleRrn"`
+	AlibabaOidcProviderArn  string `json:"oidcProviderRrn"`
+	AlibabaOidcTokenFile    string `json:"oidcTokenFile"`
 }
 
 // IsEmpty returns true if all fields in config are empty, false if not.
@@ -137,7 +147,10 @@ func (ai *AlibabaInfo) IsEmpty() bool {
 	return ai.AlibabaClusterRegion == "" &&
 		ai.AlibabaServiceKeyName == "" &&
 		ai.AlibabaServiceKeySecret == "" &&
-		ai.AlibabaAccountID == ""
+		ai.AlibabaAccountID == "" &&
+		ai.AlibabaRoleArn == "" &&
+		ai.AlibabaOidcProviderArn == "" &&
+		ai.AlibabaOidcTokenFile == ""
 }
 
 // AlibabaAccessKey holds Alibaba credentials parsing from the service-key.json file.
@@ -145,6 +158,13 @@ func (ai *AlibabaInfo) IsEmpty() bool {
 type AlibabaAccessKey struct {
 	AccessKeyID     string `json:"alibaba_access_key_id"`
 	SecretAccessKey string `json:"alibaba_secret_access_key"`
+}
+
+// AlibabaOidcKey holds Alibaba credentials parsing from the service-key.json file.
+type AlibabaOidcKey struct {
+	RoleArn         string `json:"role_arn"`
+	OidcProviderArn string `json:"oidc_provider_arn"`
+	OidcTokenFile   string `json:"oidc_token_file"`
 }
 
 // Slim Version of k8s disk assigned to a node or PV.
@@ -335,8 +355,10 @@ type Alibaba struct {
 	// The following fields are unexported because of avoiding any leak of secrets of these keys.
 	// Alibaba Access key used specifically in signer interface used to sign API calls
 	accessKey *credentials.AccessKeyCredential
+	// Alibaba OIDC credential
+	oidc *credentials.OIDCCredential
 	// Map of regionID to sdk.client to call API for that region
-	clients map[string]*sdk.Client
+	clients map[string]*openapi.Client
 }
 
 // GetAlibabaAccessKey return the Access Key used to interact with the Alibaba cloud, if not set it
@@ -380,23 +402,44 @@ func (alibaba *Alibaba) GetAlibabaAccessKey() (*credentials.AccessKeyCredential,
 	return alibaba.accessKey, nil
 }
 
-func (alibaba *Alibaba) GetAlibabaCloudInfo() (*AlibabaInfo, error) {
+func (alibaba *Alibaba) GetAlibabaOidc() (*credentials.OIDCCredential, error) {
+	if alibaba.oidcisLoaded() {
+		return alibaba.oidc, nil
+	}
+
 	config, err := alibaba.GetConfig()
 	if err != nil {
-		return nil, fmt.Errorf("could not retrieve AlibabaCloudInfo %s", err)
+		return nil, fmt.Errorf("error getting the default config for Alibaba Cloud provider: %w", err)
 	}
 
-	aak, err := alibaba.GetAlibabaAccessKey()
-	if err != nil {
-		return nil, err
+	if config.AlibabaRoleArn == "" {
+		config.AlibabaRoleArn = ocenv.GetAlibabaCloudRoleArn()
+	}
+	if config.AlibabaOidcProviderArn == "" {
+		config.AlibabaOidcProviderArn = ocenv.GetAlibabaCloudOidcProviderArn()
+	}
+	if config.AlibabaOidcTokenFile == "" {
+		config.AlibabaOidcTokenFile = ocenv.GetAlibabaOidcTokenFile()
 	}
 
-	return &AlibabaInfo{
-		AlibabaClusterRegion:    config.AlibabaClusterRegion,
-		AlibabaServiceKeyName:   aak.AccessKeyId,
-		AlibabaServiceKeySecret: aak.AccessKeySecret,
-		AlibabaAccountID:        config.ProjectID,
-	}, nil
+	if config.AlibabaRoleArn == "" && config.AlibabaOidcProviderArn == "" && config.AlibabaOidcTokenFile == "" {
+		log.Debugf("missing service key values for Alibaba cloud integration attempting to use service account integration")
+		err := alibaba.loadAlibabaOidcAndSetEnv(true)
+		if err != nil {
+			return nil, fmt.Errorf("unable to set the Alibaba Cloud oidc from config file %w", err)
+		}
+		config.AlibabaRoleArn = ocenv.GetAlibabaCloudRoleArn()
+		config.AlibabaOidcProviderArn = ocenv.GetAlibabaCloudOidcProviderArn()
+		config.AlibabaOidcTokenFile = ocenv.GetAlibabaOidcTokenFile()
+	}
+
+	if config.AlibabaRoleArn == "" && config.AlibabaOidcProviderArn == "" && config.AlibabaOidcTokenFile == "" {
+		return nil, fmt.Errorf("failed to get the oidc for the current alibaba role")
+	}
+
+	alibaba.oidc = &credentials.OIDCCredential{RoleArn: config.AlibabaRoleArn, OIDCProviderArn: config.AlibabaOidcProviderArn, OIDCTokenFilePath: config.AlibabaOidcTokenFile}
+
+	return alibaba.oidc, nil
 }
 
 // DownloadPricingData satisfies the provider interface and downloads the prices for Node instances and PVs.
@@ -404,50 +447,40 @@ func (alibaba *Alibaba) DownloadPricingData() error {
 	alibaba.DownloadPricingDataLock.Lock()
 	defer alibaba.DownloadPricingDataLock.Unlock()
 
-	var aak *credentials.AccessKeyCredential
 	var err error
-
-	if !alibaba.accessKeyisLoaded() {
-		aak, err = alibaba.GetAlibabaAccessKey()
-		if err != nil {
-			return fmt.Errorf("unable to get the access key information: %w", err)
-		}
-	} else {
-		aak = alibaba.accessKey
-	}
 
 	c, err := alibaba.Config.GetCustomPricingData()
 	if err != nil {
 		return fmt.Errorf("error downloading default pricing data: %w", err)
 	}
-
 	// Get all the nodes from Alibaba cluster.
 	nodeList := alibaba.Clientset.GetAllNodes()
-
-	var client *sdk.Client
-	var signer *signers.AccessKeySigner
+	var client *openapi.Client
 	var ok bool
 	var lookupKey string
-	alibaba.clients = make(map[string]*sdk.Client)
+	alibaba.clients = make(map[string]*openapi.Client)
 	alibaba.Pricing = make(map[string]*AlibabaPricing)
 
 	for _, node := range nodeList {
 		pricingObj := &AlibabaPricing{}
 		slimK8sNode := generateSlimK8sNodeFromV1Node(node)
-
 		if client, ok = alibaba.clients[slimK8sNode.RegionID]; !ok {
-			client, err = sdk.NewClientWithAccessKey(slimK8sNode.RegionID, aak.AccessKeyId, aak.AccessKeySecret)
+			config, err := createConfig(slimK8sNode.RegionID, slimK8sNode.ProviderID, alibaba)
+			if err != nil {
+				return fmt.Errorf("unable to create alibaba cloud sdk client credential config : %w", err)
+			}
+
+			client, err = openapi.NewClient(&config)
 			if err != nil {
 				return fmt.Errorf("unable to initiate alibaba cloud sdk client for region %s : %w", slimK8sNode.RegionID, err)
 			}
 			alibaba.clients[slimK8sNode.RegionID] = client
 		}
-		signer = signers.NewAccessKeySigner(aak)
 
 		// Adjust the system Disk information of a Node by retrieving the details of associated disk. If unable to retrieve set it to empty
 		// system disk to pass through and use defaults with Alibaba pricing API.
 		instanceID := getInstanceIDFromProviderID(slimK8sNode.ProviderID)
-		slimK8sNode.SystemDisk = getSystemDiskInfoOfANode(instanceID, slimK8sNode.RegionID, client, signer)
+		slimK8sNode.SystemDisk = getSystemDiskInfoOfANode(instanceID, slimK8sNode.RegionID, client)
 
 		lookupKey, err = determineKeyForPricing(slimK8sNode)
 		if err != nil {
@@ -459,7 +492,7 @@ func (alibaba *Alibaba) DownloadPricingData() error {
 			continue
 		}
 
-		pricingObj, err = processDescribePriceAndCreateAlibabaPricing(client, slimK8sNode, signer, c)
+		pricingObj, err = processDescribePriceAndCreateAlibabaPricing(client, slimK8sNode, c)
 
 		if err != nil {
 			return fmt.Errorf("failed to create pricing information for node with type %s with error: %w", slimK8sNode.InstanceType, err)
@@ -498,14 +531,18 @@ func (alibaba *Alibaba) DownloadPricingData() error {
 			continue
 		}
 		if client, ok = alibaba.clients[slimK8sDisk.RegionID]; !ok {
-			client, err = sdk.NewClientWithAccessKey(slimK8sDisk.RegionID, aak.AccessKeyId, aak.AccessKeySecret)
+			config, err := createConfig(slimK8sDisk.RegionID, slimK8sDisk.ProviderID, alibaba)
+			if err != nil {
+				return fmt.Errorf("unable to create alibaba cloud sdk client credential config : %w", err)
+			}
+
+			client, err = openapi.NewClient(&config)
 			if err != nil {
 				return fmt.Errorf("unable to initiate alibaba cloud sdk client for region %s : %w", slimK8sDisk.RegionID, err)
 			}
 			alibaba.clients[slimK8sDisk.RegionID] = client
 		}
-		signer = signers.NewAccessKeySigner(aak)
-		pricingObj, err = processDescribePriceAndCreateAlibabaPricing(client, slimK8sDisk, signer, c)
+		pricingObj, err = processDescribePriceAndCreateAlibabaPricing(client, slimK8sDisk, c)
 		if err != nil {
 			return fmt.Errorf("failed to create pricing information for pv with category %s with error: %w", slimK8sDisk.DiskCategory, err)
 		}
@@ -663,6 +700,48 @@ func (alibaba *Alibaba) loadAlibabaAuthSecretAndSetEnv(force bool) error {
 	return nil
 }
 
+func (alibaba *Alibaba) loadAlibabaOidcAndSetEnv(force bool) error {
+	if !force && alibaba.oidcisLoaded() {
+		return nil
+	}
+
+	exists, err := fileutil.FileExists(models.AuthSecretPath)
+	if !exists || err != nil {
+		return fmt.Errorf("failed to locate service account file: %s with err: %w", models.AuthSecretPath, err)
+	}
+
+	result, err := os.ReadFile(models.AuthSecretPath)
+	if err != nil {
+		return fmt.Errorf("failed to read service account file: %s with err: %w", models.AuthSecretPath, err)
+	}
+
+	var o *Oidc
+	err = json.Unmarshal(result, &o)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshall access key id and access key secret with err: %w", err)
+	}
+
+	err = env.Set(ocenv.AlibabaCloudRoleArnEnvVar, o.RoleArn)
+	if err != nil {
+		return fmt.Errorf("failed to set environment variable: %s with err: %w", ocenv.AlibabaCloudRoleArnEnvVar, err)
+	}
+	err = env.Set(ocenv.AlibabaCloudOidcProviderArnEnvVar, o.OIDCProviderArn)
+	if err != nil {
+		return fmt.Errorf("failed to set environment variable: %s with err: %w", ocenv.AlibabaCloudOidcProviderArnEnvVar, err)
+	}
+	err = env.Set(ocenv.AlibabaCloudOidcTokenFileEnvVar, o.OIDCTokenFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to set environment variable: %s with err: %w", ocenv.AlibabaCloudOidcTokenFileEnvVar, err)
+	}
+
+	alibaba.oidc = &credentials.OIDCCredential{
+		RoleArn:           o.RoleArn,
+		OIDCProviderArn:   o.OIDCProviderArn,
+		OIDCTokenFilePath: o.OIDCTokenFilePath,
+	}
+	return nil
+}
+
 // Regions returns a current supported list of Alibaba regions
 func (alibaba *Alibaba) Regions() []string {
 
@@ -795,12 +874,20 @@ func (alibaba *Alibaba) accessKeyisLoaded() bool {
 	if alibaba.accessKey == nil {
 		return false
 	}
-	if alibaba.accessKey.AccessKeyId == "" {
+	if alibaba.accessKey.AccessKeyId == "" || alibaba.accessKey.AccessKeySecret == "" {
 		return false
 	}
-	if alibaba.accessKey.AccessKeySecret == "" {
+	return true
+}
+
+func (alibaba *Alibaba) oidcisLoaded() bool {
+	if alibaba.oidc == nil {
 		return false
 	}
+	if alibaba.oidc.OIDCProviderArn == "" || alibaba.oidc.RoleArn == "" || alibaba.oidc.OIDCTokenFilePath == "" {
+		return false
+	}
+
 	return true
 }
 
@@ -857,11 +944,8 @@ func (alibabaNodeKey *AlibabaNodeKey) GPUCount() int {
 func (alibaba *Alibaba) GetKey(mapValue map[string]string, node *v1.Node) models.Key {
 	slimK8sNode := generateSlimK8sNodeFromV1Node(node)
 
-	var aak *credentials.AccessKeyCredential
-	var err error
 	var ok bool
-	var client *sdk.Client
-	var signer *signers.AccessKeySigner
+	var client *openapi.Client
 
 	optimizedKeyword := ""
 	if slimK8sNode.IsIoOptimized {
@@ -872,25 +956,14 @@ func (alibaba *Alibaba) GetKey(mapValue map[string]string, node *v1.Node) models
 
 	var diskCategory, diskSizeInGiB, diskPerformanceLevel string
 
-	if !alibaba.accessKeyisLoaded() {
-		aak, err = alibaba.GetAlibabaAccessKey()
+	if client, ok = alibaba.clients[slimK8sNode.RegionID]; !ok {
+		config, err := createConfig(slimK8sNode.RegionID, slimK8sNode.ProviderID, alibaba)
 		if err != nil {
-			log.Warnf("unable to set the signer for node with providerID %s to retrieve the key skipping SystemDisk Retrieval with err: %v", slimK8sNode.ProviderID, err)
+			log.Warnf("unable to create alibaba cloud sdk client credential config : %w", err)
 			return NewAlibabaNodeKey(slimK8sNode, optimizedKeyword, diskCategory, diskSizeInGiB, diskPerformanceLevel)
 		}
-	} else {
-		aak = alibaba.accessKey
-	}
 
-	signer = signers.NewAccessKeySigner(aak)
-
-	if aak == nil {
-		log.Warnf("unable to retrieve the Alibaba API keys for node with providerID %s hence skipping SystemDisk Retrieval", slimK8sNode.ProviderID)
-		return NewAlibabaNodeKey(slimK8sNode, optimizedKeyword, diskCategory, diskSizeInGiB, diskPerformanceLevel)
-	}
-
-	if client, ok = alibaba.clients[slimK8sNode.RegionID]; !ok {
-		client, err = sdk.NewClientWithAccessKey(slimK8sNode.RegionID, aak.AccessKeyId, aak.AccessKeySecret)
+		client, err = openapi.NewClient(&config)
 		if err != nil {
 			log.Warnf("unable to set the client  for node with providerID %s to retrieve the key skipping SystemDisk Retrieval with err: %v", slimK8sNode.ProviderID, err)
 			return NewAlibabaNodeKey(slimK8sNode, optimizedKeyword, diskCategory, diskSizeInGiB, diskPerformanceLevel)
@@ -899,7 +972,7 @@ func (alibaba *Alibaba) GetKey(mapValue map[string]string, node *v1.Node) models
 	}
 
 	instanceID := getInstanceIDFromProviderID(slimK8sNode.ProviderID)
-	slimK8sNode.SystemDisk = getSystemDiskInfoOfANode(instanceID, slimK8sNode.RegionID, client, signer)
+	slimK8sNode.SystemDisk = getSystemDiskInfoOfANode(instanceID, slimK8sNode.RegionID, client)
 
 	if slimK8sNode.SystemDisk != nil {
 		diskCategory = slimK8sNode.SystemDisk.DiskCategory
@@ -953,6 +1026,60 @@ func (alibabaPVKey *AlibabaPVKey) GetStorageClass() string {
 	return alibabaPVKey.StorageClassName
 }
 
+func createConfig(regionID, providerID string, alibaba *Alibaba) (openapi.Config, error) {
+	var aak *credentials.AccessKeyCredential
+	var oidc *credentials.OIDCCredential
+	var cred credentials.Credential
+	var err error
+
+	if !alibaba.accessKeyisLoaded() {
+		aak, err = alibaba.GetAlibabaAccessKey()
+		if err != nil || aak.AccessKeyId == "" || aak.AccessKeySecret == "" {
+			//log.Warnf("unable to set the signer for node with providerID %s to retrieve the key skipping SystemDisk Retrieval with err: %v", providerID, err)
+			// return NewAlibabaNodeKey(slimK8sNode, optimizedKeyword, diskCategory, diskSizeInGiB, diskPerformanceLevel)
+			if !alibaba.oidcisLoaded() {
+				oidc, err = alibaba.GetAlibabaOidc()
+				if err != nil {
+					log.Warnf("unable to set the signer for node with providerID %s to retrieve the key skipping SystemDisk Retrieval with err: %v", providerID, err)
+					return openapi.Config{}, err
+				}
+			} else {
+				oidc = alibaba.oidc
+			}
+			cred, err = credentials.NewCredential(&credentials.Config{
+				RoleArn:           tea.String(oidc.RoleArn),
+				OIDCProviderArn:   tea.String(oidc.OIDCProviderArn),
+				OIDCTokenFilePath: tea.String(oidc.OIDCTokenFilePath),
+				Type:              tea.String(OIDC_CREDENTIAL_TYPE),
+				RoleSessionName:   tea.String(OIDC_ROLE_SESSION_NAME),
+			})
+			if err != nil {
+				log.Warnf("unable to set the signer for node with providerID %s to retrieve the key skipping SystemDisk Retrieval with err: %v", providerID, err)
+				return openapi.Config{}, err
+			}
+		}
+	} else {
+		aak = alibaba.accessKey
+	}
+
+	if aak == nil && oidc == nil {
+		log.Warnf("unable to retrieve the Alibaba API keys for node with providerID %s hence skipping SystemDisk Retrieval", providerID)
+		return openapi.Config{}, errors.New("unable to retrieve the Alibaba API keys")
+	}
+
+	config := openapi.Config{
+		RegionId:   tea.String(regionID),
+		Endpoint:   tea.String(ALIBABA_ECS_PRODUCT_CODE + "." + regionID + strings.TrimPrefix(ALIBABA_ECS_DOMAIN, ALIBABA_ECS_PRODUCT_CODE)),
+		Credential: cred,
+	}
+	if aak != nil {
+		config.AccessKeyId = tea.String(aak.AccessKeyId)
+		config.AccessKeySecret = tea.String(aak.AccessKeySecret)
+	}
+
+	return config, nil
+}
+
 // Helper functions for alibabaprovider.go
 
 // createDescribePriceACSRequest creates the HTTP GET request for the required resources' Price information,
@@ -960,73 +1087,103 @@ func (alibabaPVKey *AlibabaPVKey) GetStorageClass() string {
 // When supporting different new type of instances like Compute Optimized, Memory Optimized etc make sure you add the instance type
 // in unit test and check if it works or not to create the ack request and processDescribePriceAndCreateAlibabaPricing function
 // else more parameters need to be pulled from kubernetes node response or gather information from elsewhere and function modified.
-func createDescribePriceACSRequest(i interface{}) (*requests.CommonRequest, error) {
-	request := requests.NewCommonRequest()
-	request.Method = requests.GET
-	request.Product = ALIBABA_ECS_PRODUCT_CODE
-	request.Domain = ALIBABA_ECS_DOMAIN
-	request.Version = ALIBABA_ECS_VERSION
-	request.Scheme = requests.HTTPS
-	request.ApiName = ALIBABA_DESCRIBE_PRICE_API_ACTION
+func createDescribePriceACSRequest(i interface{}) (openapi.Params, openapi.OpenApiRequest, error) {
+	params := openapi.Params{
+		Action:      tea.String("DescribePrice"),
+		Version:     tea.String(ALIBABA_ECS_VERSION),
+		Protocol:    tea.String(requests.HTTPS),
+		Pathname:    tea.String("/"),
+		Method:      tea.String(requests.GET),
+		AuthType:    tea.String(""),
+		Style:       tea.String("ROA"),
+		ReqBodyType: tea.String("none"),
+		BodyType:    tea.String("none"),
+	}
+
+	request := openapi.OpenApiRequest{
+		Query: make(map[string]*string, 1),
+	}
+
 	switch i.(type) {
 	case *SlimK8sNode:
 		node := i.(*SlimK8sNode)
-		request.QueryParams["RegionId"] = node.RegionID
-		request.QueryParams["ResourceType"] = ALIBABA_INSTANCE_RESOURCE_TYPE
-		request.QueryParams["InstanceType"] = node.InstanceType
-		request.QueryParams["PriceUnit"] = node.PriceUnit
+		request.Query["RegionId"] = tea.String(node.RegionID)
+		request.Query["ResourceType"] = tea.String(ALIBABA_INSTANCE_RESOURCE_TYPE)
+		request.Query["InstanceType"] = tea.String(node.InstanceType)
+		request.Query["PriceUnit"] = tea.String(node.PriceUnit)
 		if node.SystemDisk != nil {
 			// Only if the required information is present it should be overridden else default it via the API
 			if node.SystemDisk.DiskCategory != "" {
-				request.QueryParams["SystemDisk.Category"] = node.SystemDisk.DiskCategory
+				request.Query["SystemDisk.Category"] = tea.String(node.SystemDisk.DiskCategory)
 			}
 			if node.SystemDisk.SizeInGiB != "" {
-				request.QueryParams["SystemDisk.Size"] = node.SystemDisk.SizeInGiB
+				request.Query["SystemDisk.Size"] = tea.String(node.SystemDisk.SizeInGiB)
 			}
 			if node.SystemDisk.PerformanceLevel != "" {
-				request.QueryParams["SystemDisk.PerformanceLevel"] = node.SystemDisk.PerformanceLevel
+				request.Query["SystemDisk.PerformanceLevel"] = tea.String(node.SystemDisk.PerformanceLevel)
 			}
 		} else {
 			// When System Disk information is not available for instance family g6e, r7 and r6e the defaults in
 			// DescribePrice dont default rightly to cloud_essd for these instances.
 			if slices.Contains(alibabaDefaultToCloudEssd, node.InstanceTypeFamily) {
-				request.QueryParams["SystemDisk.Category"] = ALIBABA_DISK_CLOUD_ESSD_CATEGORY
+				request.Query["SystemDisk.Category"] = tea.String(ALIBABA_DISK_CLOUD_ESSD_CATEGORY)
 			}
 		}
-		request.TransToAcsRequest()
-		return request, nil
+
+		return params, request, nil
 	case *SlimK8sDisk:
 		disk := i.(*SlimK8sDisk)
-		request.QueryParams["RegionId"] = disk.RegionID
-		request.QueryParams["PriceUnit"] = disk.PriceUnit
-		request.QueryParams["ResourceType"] = ALIBABA_DISK_RESOURCE_TYPE
-		request.QueryParams[fmt.Sprintf("%s.%d.Size", ALIBABA_DATA_DISK_PREFIX, 1)] = disk.SizeInGiB
-		request.QueryParams[fmt.Sprintf("%s.%d.Category", ALIBABA_DATA_DISK_PREFIX, 1)] = disk.DiskCategory
+		request.Query["RegionId"] = tea.String(disk.RegionID)
+		request.Query["PriceUnit"] = tea.String(disk.PriceUnit)
+		request.Query["ResourceType"] = tea.String(ALIBABA_DISK_RESOURCE_TYPE)
+		request.Query[fmt.Sprintf("%s.%d.Size", ALIBABA_DATA_DISK_PREFIX, 1)] = tea.String(disk.SizeInGiB)
+		request.Query[fmt.Sprintf("%s.%d.Category", ALIBABA_DATA_DISK_PREFIX, 1)] = tea.String(disk.DiskCategory)
 		// Performance level defaults to PL1 if not present in volume attribute.
 		if disk.PerformanceLevel != "" {
-			request.QueryParams[fmt.Sprintf("%s.%d.PerformanceLevel", ALIBABA_DATA_DISK_PREFIX, 1)] = disk.PerformanceLevel
+			request.Query[fmt.Sprintf("%s.%d.PerformanceLevel", ALIBABA_DATA_DISK_PREFIX, 1)] = tea.String(disk.PerformanceLevel)
 		}
-		request.TransToAcsRequest()
-		return request, nil
+
+		return params, request, nil
 	default:
-		return nil, fmt.Errorf("unsupported ECS type (%T) for DescribePrice at this time", i)
+		return openapi.Params{}, openapi.OpenApiRequest{}, fmt.Errorf("unsupported ECS type (%T) for DescribePrice at this time", i)
 	}
 }
 
 // createDescribeDisksCSRequest creates the HTTP GET Request to map the system disk to the InstanceID
-func createDescribeDisksACSRequest(instanceID, regionID, diskType string) (*requests.CommonRequest, error) {
-	request := requests.NewCommonRequest()
-	request.Method = requests.GET
-	request.Product = ALIBABA_ECS_PRODUCT_CODE
-	request.Domain = ALIBABA_ECS_DOMAIN
-	request.Version = ALIBABA_ECS_VERSION
-	request.Scheme = requests.HTTPS
-	request.ApiName = ALIBABA_DESCRIBE_DISK_API_ACTION
-	request.QueryParams["RegionId"] = regionID
-	request.QueryParams["InstanceId"] = instanceID
-	request.QueryParams["DiskType"] = diskType
-	request.TransToAcsRequest()
-	return request, nil
+func createDescribeDisksACSRequest(instanceID, regionID, diskType string) (openapi.Params, openapi.OpenApiRequest) {
+	params := openapi.Params{
+		Action:      tea.String("DescribeDisks"),
+		Version:     tea.String(ALIBABA_ECS_VERSION),
+		Protocol:    tea.String(requests.HTTPS),
+		Pathname:    tea.String("/"),
+		Method:      tea.String(requests.POST),
+		AuthType:    tea.String(""),
+		Style:       tea.String("ROA"),
+		ReqBodyType: tea.String("none"),
+		BodyType:    tea.String("none"),
+	}
+
+	request := openapi.OpenApiRequest{
+		Query: map[string]*string{
+			"RegionId":   tea.String(regionID),
+			"InstanceId": tea.String(instanceID),
+			"DiskType":   tea.String(diskType),
+		},
+	}
+
+	return params, request
+}
+
+func convertStatusCode(response map[string]interface{}) int {
+	v, ok := response["statusCode"]; if ok {
+		i, err := v.(ejson.Number).Int64(); if err == nil && i == 200 {
+			return 200
+		} else {
+			return 0
+		}
+	}else {
+		return 0
+	}
 }
 
 // determineKeyForPricing generate a unique key from SlimK8sNode object that is constructed from v1.Node object and
@@ -1079,7 +1236,7 @@ type DescribePriceResponse struct {
 }
 
 // processDescribePriceAndCreateAlibabaPricing processes the DescribePrice API and generates the pricing information for alibaba node resource and alibaba pv resource that's backed by cloud disk.
-func processDescribePriceAndCreateAlibabaPricing(client *sdk.Client, i interface{}, signer *signers.AccessKeySigner, custom *models.CustomPricing) (pricing *AlibabaPricing, err error) {
+func processDescribePriceAndCreateAlibabaPricing(client *openapi.Client, i interface{}, custom *models.CustomPricing) (pricing *AlibabaPricing, err error) {
 	pricing = &AlibabaPricing{}
 	var response DescribePriceResponse
 
@@ -1089,18 +1246,20 @@ func processDescribePriceAndCreateAlibabaPricing(client *sdk.Client, i interface
 	switch i.(type) {
 	case *SlimK8sNode:
 		node := i.(*SlimK8sNode)
-		req, err := createDescribePriceACSRequest(node)
+		params, req, err := createDescribePriceACSRequest(node)
 		if err != nil {
 			return nil, err
 		}
-		resp, err := client.ProcessCommonRequestWithSigner(req, signer)
+		resp, err := client.DoRequest(&params, &req, &service.RuntimeOptions{})
 		pricing.NodeAttributes = NewAlibabaNodeAttributes(node)
-		if err != nil || resp.GetHttpStatus() != 200 {
-			// Can be defaulted to some value here?
-			return nil, fmt.Errorf("unable to fetch information for node with InstanceType: %v", node.InstanceType)
+		if err != nil || convertStatusCode(resp) != 200 {
+			return nil, fmt.Errorf("unable to process Describe Disk request with err not is nil or  statusCode not is 200")
 		} else {
+			v, ok := resp["body"].(string); if !ok{
+				return nil, fmt.Errorf("unable to unmarshall Describe Disk response with response not container body")
+			}
 			// This is where population of Pricing happens
-			err = json.Unmarshal(resp.GetHttpContentBytes(), &response)
+			err = json.Unmarshal([]byte(v), &response)
 			if err != nil {
 				return nil, fmt.Errorf("unable to unmarshall json response to custom struct with err: %w", err)
 			}
@@ -1116,16 +1275,19 @@ func processDescribePriceAndCreateAlibabaPricing(client *sdk.Client, i interface
 		}
 	case *SlimK8sDisk:
 		disk := i.(*SlimK8sDisk)
-		req, err := createDescribePriceACSRequest(disk)
+		params, req, err := createDescribePriceACSRequest(disk)
 		if err != nil {
 			return nil, err
 		}
-		resp, err := client.ProcessCommonRequestWithSigner(req, signer)
-		if err != nil || resp.GetHttpStatus() != 200 {
-			return nil, fmt.Errorf("unable to fetch information for disk with DiskType: %v with err: %w", disk.DiskCategory, err)
+		resp, err := client.DoRequest(&params, &req, &service.RuntimeOptions{})
+		if err != nil || convertStatusCode(resp) != 200 {
+			return nil, fmt.Errorf("unable to process Describe Disk request with err not is nil or  statusCode not is 200")
 		} else {
+			v, ok := resp["body"].(string); if !ok{
+				return nil, fmt.Errorf("unable to unmarshall Describe Disk response with response not container body")
+			}
 			// This is where population of Pricing happens
-			err = json.Unmarshal(resp.GetHttpContentBytes(), &response)
+			err = json.Unmarshal([]byte(v), &response)
 			if err != nil {
 				return nil, fmt.Errorf("unable to unmarshall json response to custom struct with err: %w", err)
 			}
@@ -1195,27 +1357,26 @@ type DescribeDiskResponse struct {
 // getSystemDiskInfoOfANode gets the relevant System disk information associated with the Node given by the instanceID
 // in form of a SlimK8sDisk with only relevant information that can adjust the node pricing. If any error occurs return
 // an empty disk to not impact any default set at the price retrieval of the node.
-func getSystemDiskInfoOfANode(instanceID, regionID string, client *sdk.Client, signer *signers.AccessKeySigner) (systemDisk *SlimK8sDisk) {
+func getSystemDiskInfoOfANode(instanceID, regionID string, client *openapi.Client) (systemDisk *SlimK8sDisk) {
 	systemDisk = &SlimK8sDisk{}
 	var response DescribeDiskResponse
 	// if instanceID is empty string return an empty k8s
 	if instanceID == "" {
 		return
 	}
-	req, err := createDescribeDisksACSRequest(instanceID, regionID, ALIBABA_SYSTEM_DISK_CATEGORY)
-	// if any error occurs return an empty disk to not impact default pricing.
-	if err != nil {
-		log.Warnf("Unable to create Describe Disk Request with err: %v for node with InstanceID: %s, hence defaulting it to an empty system disk to pass through to defaults", err, instanceID)
-		return
-	}
+	params, req := createDescribeDisksACSRequest(instanceID, regionID, ALIBABA_SYSTEM_DISK_CATEGORY)
 
-	resp, err := client.ProcessCommonRequestWithSigner(req, signer)
-	if err != nil || resp.GetHttpStatus() != 200 {
-		log.Warnf("Unable to process Describe Disk request with err: %v and errcode: %d for the node with InstanceID: %s, hence defaulting it to an empty system disk to pass through to defaults", err, resp.GetHttpStatus(), instanceID)
+	resp, err := client.DoRequest(&params, &req, &service.RuntimeOptions{})
+	if err != nil || convertStatusCode(resp) != 200 {
+		log.Warnf("Unable to process Describe Disk request with err not is nil or statusCode not is 200")
 		return
 	} else {
+		v, ok := resp["body"].(string); if !ok{
+			log.Warnf("Unable to unmarshall Describe Disk response with response not container body")
+			return
+		}
 		// This is where population of Pricing happens
-		err = json.Unmarshal(resp.GetHttpContentBytes(), &response)
+		err = json.Unmarshal([]byte(v), &response)
 		if err != nil {
 			log.Warnf("Unable to unmarshall Describe Disk response with err: %v for the node with InstanceID: %s, hence defaulting it to an empty system disk to pass through to defaults", err, instanceID)
 			return

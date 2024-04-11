@@ -1,11 +1,12 @@
 # <https://www.opencost.io/docs/>
----
 
 # The namespace OpenCost will run in
 apiVersion: v1
 kind: Namespace
 metadata:
-    name: opencost
+  name: opencost
+  labels:
+    pod-identity.alibabacloud.com/injection: 'on'
 ---
 
 # Service account for permissions
@@ -14,6 +15,8 @@ kind: ServiceAccount
 metadata:
   name: opencost
   namespace: opencost
+  annotations:
+    pod-identity.alibabacloud.com/role-name: ljx-test-rrsa
 ---
 
 # Cluster role giving OpenCost to get, list, watch required resources
@@ -23,78 +26,78 @@ kind: ClusterRole
 metadata:
   name: opencost
 rules:
-  - apiGroups:
-      - ''
-    resources:
-      - configmaps
-      - deployments
-      - nodes
-      - pods
-      - services
-      - resourcequotas
-      - replicationcontrollers
-      - limitranges
-      - persistentvolumeclaims
-      - persistentvolumes
-      - namespaces
-      - endpoints
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - extensions
-    resources:
-      - daemonsets
-      - deployments
-      - replicasets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - apps
-    resources:
-      - statefulsets
-      - deployments
-      - daemonsets
-      - replicasets
-    verbs:
-      - list
-      - watch
-  - apiGroups:
-      - batch
-    resources:
-      - cronjobs
-      - jobs
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - autoscaling
-    resources:
-      - horizontalpodautoscalers
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - policy
-    resources:
-      - poddisruptionbudgets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - storage.k8s.io
-    resources:
-      - storageclasses
-    verbs:
-      - get
-      - list
-      - watch
+- apiGroups:
+  - ''
+  resources:
+  - configmaps
+  - deployments
+  - nodes
+  - pods
+  - services
+  - resourcequotas
+  - replicationcontrollers
+  - limitranges
+  - persistentvolumeclaims
+  - persistentvolumes
+  - namespaces
+  - endpoints
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - extensions
+  resources:
+  - daemonsets
+  - deployments
+  - replicasets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  - deployments
+  - daemonsets
+  - replicasets
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
+  - get
+  - list
+  - watch
 
 ---
 
@@ -108,9 +111,9 @@ roleRef:
   kind: ClusterRole
   name: opencost
 subjects:
-  - kind: ServiceAccount
-    name: opencost
-    namespace: opencost
+- kind: ServiceAccount
+  name: opencost
+  namespace: opencost
 ---
 
 # Create a deployment for a single cost model pod
@@ -142,41 +145,41 @@ spec:
       restartPolicy: Always
       serviceAccountName: opencost
       containers:
-        - image: ghcr.io/opencost/opencost:latest
-          name: opencost
-          resources:
-            requests:
-              cpu: "10m"
-              memory: "55M"
-            limits:
-              cpu: "999m"
-              memory: "1G"
-          env:
-            - name: PROMETHEUS_SERVER_ENDPOINT
-              value: "http://prometheus-server.prometheus-system.svc" # The endpoint should have the form http://<service-name>.<namespace-name>.svc
-            - name: CLOUD_PROVIDER_API_KEY
-              value: "AIzaSyD29bGxmHAVEOBYtgd8sYM2gM2ekfxQX4U" # The GCP Pricing API requires a key. This is supplied just for evaluation.
-            - name: CLUSTER_ID
-              value: "cluster-one" # Default cluster ID to use if cluster_id is not set in Prometheus metrics.
-          imagePullPolicy: Always
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            privileged: false
-            readOnlyRootFilesystem: true
-            runAsUser: 1001
-        - image: ghcr.io/opencost/opencost-ui:latest
-          name: opencost-ui
-          resources:
-            requests:
-              cpu: "10m"
-              memory: "55M"
-            limits:
-              cpu: "999m"
-              memory: "1G"
-          imagePullPolicy: Always
+      - image: registry.cn-hangzhou.aliyuncs.com/rrsa-demo/ljx-test-rrsa:opencost
+        name: opencost
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "55M"
+          limits:
+            cpu: "999m"
+            memory: "1G"
+        env:
+        - name: PROMETHEUS_SERVER_ENDPOINT
+          value: "http://arms-prom-server.arms-prom.svc:9090" # The endpoint should have the form http://<service-name>.<namespace-name>.svc
+        - name: CLOUD_PROVIDER_API_KEY
+          value: "AIzaSyD29bGxmHAVEOBYtgd8sYM2gM2ekfxQX4U" # The GCP Pricing API requires a key. This is supplied just for evaluation.
+        - name: CLUSTER_ID
+          value: "cluster-one" # Default cluster ID to use if cluster_id is not set in Prometheus metrics.
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+          runAsUser: 1001
+      - image: ghcr.io/opencost/opencost-ui:latest
+        name: opencost-ui
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "55M"
+          limits:
+            cpu: "999m"
+            memory: "1G"
+        imagePullPolicy: IfNotPresent
 ---
 
 # Expose the cost model with a service
@@ -192,12 +195,12 @@ metadata:
 spec:
   selector:
     app: opencost
-  type: ClusterIP
+  type: LoadBalancer
   ports:
-    - name: opencost
-      port: 9003
-      targetPort: 9003
-    - name: opencost-ui
-      port: 9090
-      targetPort: 9090
+  - name: opencost
+    port: 9003
+    targetPort: 9003
+  - name: opencost-ui
+    port: 9090
+    targetPort: 9090
 ---
