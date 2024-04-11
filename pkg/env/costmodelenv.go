@@ -17,8 +17,11 @@ const (
 	AWSClusterIDEnvVar       = "AWS_CLUSTER_ID"
 	AWSPricingURL            = "AWS_PRICING_URL"
 
-	AlibabaAccessKeyIDEnvVar     = "ALIBABA_ACCESS_KEY_ID"
-	AlibabaAccessKeySecretEnvVar = "ALIBABA_SECRET_ACCESS_KEY"
+	AlibabaAccessKeyIDEnvVar           = "ALIBABA_ACCESS_KEY_ID"
+	AlibabaAccessKeySecretEnvVar       = "ALIBABA_SECRET_ACCESS_KEY"
+	AlibabaCloudRoleArnEnvVar          = "ALIBABA_CLOUD_ROLE_ARN"
+	AlibabaCloudOidcProviderArnEnvVar  = "ALIBABA_CLOUD_OIDC_PROVIDER_ARN"
+	AlibabaCloudOidcTokenFileEnvVar    = "ALIBABA_CLOUD_OIDC_TOKEN_FILE"
 
 	AzureOfferIDEnvVar                   = "AZURE_OFFER_ID"
 	AzureBillingAccountEnvVar            = "AZURE_BILLING_ACCOUNT"
@@ -312,6 +315,24 @@ func GetAlibabaAccessKeyID() string {
 // the Alibaba access key secret for authentication
 func GetAlibabaAccessKeySecret() string {
 	return env.Get(AlibabaAccessKeySecretEnvVar, "")
+}
+
+// GetAlibabaCloudRoleArn returns the environment variable value for AlibabaCloudRoleArnEnvVar which represents
+// the Alibaba role arn for authentication
+func GetAlibabaCloudRoleArn() string {
+	return env.Get(AlibabaCloudRoleArnEnvVar, "")
+}
+
+// GetAlibabaCloudOidcProviderArn returns the environment variable value for AlibabaCloudOidcProviderArnEnvVar which represents
+// the Alibaba oidc provider arn for authentication
+func GetAlibabaCloudOidcProviderArn() string {
+	return env.Get(AlibabaCloudOidcProviderArnEnvVar, "")
+}
+
+// GetAlibabaOidcTokenFile returns the environment variable value for AlibabaOidcTokenFileEnvVar which represents
+// the Alibaba oidc token file for authentication
+func GetAlibabaOidcTokenFile() string {
+	return env.Get(AlibabaCloudOidcTokenFileEnvVar, "")
 }
 
 // GetAzureOfferID returns the environment variable value for AzureOfferIDEnvVar which represents

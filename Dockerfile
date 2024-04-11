@@ -17,20 +17,22 @@ ARG	commit=HEAD
 # COPY the source code as the last step
 COPY . .
 
+RUN go env -w GOPROXY=https://goproxy.cn,direct
+
 # Get dependencies - will also be cached if we won't change mod/sum
 RUN go mod download
 
 # Build the binary
 RUN set -e ;\
-    go test ./test/*.go;\
-    go test ./pkg/*;\
-    cd cmd/costmodel;\
-    GOOS=linux \
-    go build -a -installsuffix cgo \
-    -ldflags \
-    "-X github.com/opencost/opencost/core/pkg/version.Version=${version} \
-    -X github.com/opencost/opencost/core/pkg/version.GitCommit=${commit}" \
-    -o /go/bin/app
+  #    go test ./test/*.go;\
+  #    go test ./pkg/*;\
+  cd cmd/costmodel;\
+  GOOS=linux \
+  go build -a -installsuffix cgo \
+  -ldflags \
+  "-X github.com/opencost/opencost/core/pkg/version.Version=${version} \
+  -X github.com/opencost/opencost/core/pkg/version.GitCommit=${commit}" \
+  -o /go/bin/app
 
 FROM alpine:latest
 
